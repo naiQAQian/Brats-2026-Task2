@@ -1,108 +1,205 @@
-# Custom nnU-Net trainers — Week-6 CC/ED improvement plan
+# Custom nnU-Net Trainers for CC/ED Segmentation
 
-Three lightweight, version-controlled modifications to nnU-Net v2 `3d_fullres`,
-implementing `docs/nnunet_3d_fullres_idea_plan.md` and the hands-on walkthrough in
-`notebooks/week6/week6_cc_ed_improvement_plan.ipynb`. The targets are the two
-regions the baseline fails on: the **cystic component (CC)** and **edema (ED)**.
+This repository provides the source code for three lightweight modifications to the nnU-Net v2 `3d_fullres` trainer. The methods were developed to improve segmentation of small or challenging tumor subregions, particularly the **cystic component (CC)** and **edema (ED)**.
 
-| Trainer (`-tr`) | Idea | Targets | What it changes | Inference impact |
-|---|---|---|---|---|
-| `nnUNetTrainerScaleAwareDS` | 1 — scale-aware deep supervision | CC | loss only: per-class weights per DS scale | none |
-| `nnUNetTrainerEDBoundary`   | 2 — ED boundary aux head | ED | adds a training-only boundary head + BCE | none |
-| `nnUNetTrainerHierarchical` | 3 — hierarchical logits | CC + ED | swaps decoder seg layers for WT→{TC,ED}→{ET,NET,CC} heads | none |
+This is a **method-code release only**. It is intended to document the implementation of the proposed trainer modifications and support code inspection or adaptation.
 
-All three keep the standard nnU-Net architecture for **prediction/export**, so
-`scripts/predict_task2_submission.py` and `scripts/postprocess_small_components.py`
-are reused unchanged — just pass the trainer name with `--trainer`.
+It does not include the datasets, preprocessing pipeline, trained model weights, experiment configurations, prediction scripts, or complete reproduction environment used in the associated study.
 
-## How nnU-Net finds these trainers
+## Included methods
 
-nnU-Net v2 (2.8) resolves a `-tr` name by class name. This package lives outside
-the `nnunetv2` install (so it stays in the repo); point nnU-Net at it with the
-`nnUNet_extTrainer` environment variable. `scripts/setup_runpod_env.sh` sets and
-persists it. In an existing shell:
+| Trainer class               | Target    | Main modification                                    |
+| --------------------------- | --------- | ---------------------------------------------------- |
+| `nnUNetTrainerScaleAwareDS` | CC        | Scale-dependent class weighting for deep supervision |
+| `nnUNetTrainerEDBoundary`   | ED        | Training-only auxiliary boundary prediction head     |
+| `nnUNetTrainerHierarchical` | CC and ED | Hierarchical composition of segmentation logits      |
 
-```bash
-source /etc/profile.d/brats_env.sh          # exports nnUNet_extTrainer
-# or manually:
-export nnUNet_extTrainer=/workspace/code/brats-student-project/nnunet_trainers
+## Repository structure
+
+```text
+.
+├── README.md
+├── requirements.txt
+└── nnunet_trainers/
+    ├── __init__.py
+    ├── scale_aware_ds.py
+    ├── ed_boundary_head.py
+    └── hierarchical_logits.py
 ```
 
-> Set this in **both** the training shell and the prediction shell — inference
-> reconstructs the same trainer by name.
+## Method 1: Scale-aware deep supervision
 
-Verify discovery + the maths without training (CPU, no data, no GPU):
+`nnUNetTrainerScaleAwareDS` modifies the loss applied at each deep-supervision scale.
 
-```bash
-python scripts/test_custom_trainers.py
+Small CC regions may disappear when the target segmentation is downsampled for coarse decoder outputs. Supervising CC equally at every scale can therefore introduce misleading negative supervision.
+
+The trainer applies the following class-weight schedule:
+
+| Output scale               | CC weight | ED weight |
+| -------------------------- | --------: | --------: |
+| Full resolution            |       1.0 |       1.0 |
+| 1/2 resolution             |       0.7 |       1.0 |
+| 1/4 resolution             |       0.2 |       0.8 |
+| 1/8 resolution and coarser |       0.0 |       0.5 |
+
+The modification affects the training loss only. The underlying nnU-Net network architecture is unchanged.
+
+The weighting schedule can be adjusted in:
+
+```python
+_SCALE_TABLE
 ```
 
-## Per-experiment workflow
+## Method 2: ED boundary auxiliary head
 
-Change **one** thing, measure it against the `Dataset502` baseline, record it in
-the ablation table (notebook §6). Recommended order: Idea 1 → 2 → 3 (cheapest and
-most targeted first).
+`nnUNetTrainerEDBoundary` adds a training-only auxiliary head to the full-resolution decoder feature map.
 
-```bash
-source /etc/profile.d/brats_env.sh
+The auxiliary head predicts a binary ED boundary band defined approximately as:
 
-# --- Idea 1 (start here): scale-aware deep supervision, targets CC ---
-nnUNetv2_train 502 3d_fullres all -p nnUNetPlansMask -tr nnUNetTrainerScaleAwareDS \
-  > outputs/train_502_scaleaware.log 2>&1 &
-
-# --- Idea 2: ED boundary aux head, targets ED surface accuracy ---
-nnUNetv2_train 502 3d_fullres all -p nnUNetPlansMask -tr nnUNetTrainerEDBoundary
-
-# --- Idea 3: hierarchical logits, targets CC + ED ---
-nnUNetv2_train 502 3d_fullres all -p nnUNetPlansMask -tr nnUNetTrainerHierarchical
+```text
+dilate(ED) - erode(ED)
 ```
 
-Resume an interrupted run by appending `--c`. Watch the per-class pseudo-Dice for
-CC/ED in the log — that's the early signal. **One model per GPU.**
+A binary cross-entropy boundary loss is added to the standard nnU-Net segmentation loss:
 
-Predict the 91 validation cases with the matching trainer (writes to a separate
-per-trainer output dir, so the baseline predictions are never overwritten):
-
-```bash
-python scripts/predict_task2_submission.py --dataset-id 502 --dataset-name BraTSPEDfull \
-  --plan nnUNetPlansMask --trainer nnUNetTrainerScaleAwareDS --folds all \
-  --checkpoint checkpoint_final.pth --postprocess --zip
+```text
+total loss = segmentation loss + boundary_weight × boundary loss
 ```
 
-Then upload the zip to the validation panel and record the per-region DSC/NSD.
+The main configurable attributes are:
 
-## What each trainer does (and its knobs)
+```python
+boundary_weight = 0.3
+boundary_iterations = 2
+```
 
-### Idea 1 — `nnUNetTrainerScaleAwareDS` (`scale_aware_ds.py`)
-Loss-only. Keeps nnU-Net's per-scale scalar weights, but multiplies in a
-per-class weight at each deep-supervision scale so a tiny CC blob isn't penalised
-at coarse resolutions where it has downsampled away. Weight schedule (CC, ED):
+The auxiliary output is used only during training and is not returned during evaluation.
 
-| scale | full | 1/2 | 1/4 | 1/8 (+coarser) |
-|---|---|---|---|---|
-| CC | 1.0 | 0.7 | 0.2 | 0.0 |
-| ED | 1.0 | 1.0 | 0.8 | 0.5 |
+## Method 3: Hierarchical logits
 
-Tune in `_SCALE_TABLE`. CE uses per-class `weight`; Dice uses a normalized
-weighted class-mean (`WeightedMemoryEfficientSoftDiceLoss`).
+`nnUNetTrainerHierarchical` replaces each standard decoder segmentation layer with a hierarchical segmentation head.
 
-### Idea 2 — `nnUNetTrainerEDBoundary` (`ed_boundary_head.py`)
-Wraps the network (`EDBoundaryNet`) with a 1×1-conv aux head on the full-res
-decoder feature, trained against an ED **boundary band** (`dilate(ED) − erode(ED)`).
-`train_step` adds `boundary_weight * BCE`. Knobs (class attrs): `boundary_weight`
-(default `0.3`, plan range 0.1–0.5), `boundary_iterations` (band half-width, `2`).
-Aux head is disabled in `eval()` → zero inference cost.
+The method models the BraTS-PED label structure as:
 
-### Idea 3 — `nnUNetTrainerHierarchical` (`hierarchical_logits.py`)
-Replaces each decoder seg layer with `HierarchicalSegHead`, which predicts
-`p_wt`, `p_tc` and a 3-way core softmax and composes class probabilities along the
-label tree, so **CC only competes inside the tumor core**. It returns `log P`;
-since the 5 probs sum to 1, `softmax(log P) == P`, so training loss and inference
-both work with no pipeline changes. Deep supervision is preserved (every scale
-gets a head). The composition hard-codes the BraTS-PED label layout
-(`bg,ET,NET,CC,ED` = `0,1,2,3,4`) and asserts 5 classes.
+```text
+Whole tumor
+├── Edema
+└── Tumor core
+    ├── Enhancing tumor
+    ├── Non-enhancing tumor
+    └── Cystic component
+```
 
-## Data safety
-These trainers never read or write `/workspace/Data` outside nnU-Net's normal
-pipeline, and add no raw images to the repo. Training/prediction obey the same
-`CLAUDE.md` rules as the baseline.
+The head predicts:
+
+```text
+p_wt = probability of whole tumor
+p_tc = probability of tumor core within whole tumor
+q    = conditional probabilities of ET, NET, and CC within tumor core
+```
+
+The final class probabilities are composed as:
+
+```text
+P(background) = 1 - p_wt
+P(ED)         = p_wt × (1 - p_tc)
+P(ET)         = p_wt × p_tc × q_ET
+P(NET)        = p_wt × p_tc × q_NET
+P(CC)         = p_wt × p_tc × q_CC
+```
+
+This reduces direct competition between rare tumor-core subclasses and the background.
+
+The implementation assumes the following label layout:
+
+```text
+background = 0
+ET         = 1
+NET        = 2
+CC         = 3
+ED         = 4
+```
+
+The hierarchical trainer therefore requires five output classes in this order.
+
+## Software requirements
+
+The code was developed for:
+
+```text
+Python 3
+PyTorch
+nnU-Net v2
+```
+
+The exact non-PyTorch package versions used during development are listed in `requirements.txt`.
+
+PyTorch installation depends on the operating system and CUDA environment and is therefore not pinned in this repository.
+
+## Using the trainer classes
+
+The trainer classes are exported from the `nnunet_trainers` package:
+
+```python
+from nnunet_trainers import (
+    nnUNetTrainerScaleAwareDS,
+    nnUNetTrainerEDBoundary,
+    nnUNetTrainerHierarchical,
+)
+```
+
+They are designed as extensions of the nnU-Net v2 trainer API.
+
+Users who wish to integrate them into an nnU-Net project are responsible for configuring trainer discovery, dataset metadata, preprocessing, training plans, and execution commands for their own environment.
+
+Compatibility may depend on the installed nnU-Net version.
+
+## Scope of this release
+
+Included:
+
+* Source code for the three custom trainer implementations
+* Comments describing the method logic
+* Dependency information
+* Import definitions for the trainer package
+
+Not included:
+
+* Medical imaging data
+* Processed or derived datasets
+* Patient information
+* Model checkpoints
+* Trained weights
+* nnU-Net plans or dataset metadata
+* Training or validation outputs
+* Prediction and post-processing scripts
+* Docker images
+* Hardware-specific environment configuration
+* Exact experiment reproduction instructions
+
+The code is released as a reference implementation of the proposed methods rather than as a complete reproduction package.
+
+## Data and privacy
+
+No medical images, annotations, patient metadata, or controlled-access data are included in this repository.
+
+The trainer implementations operate through the standard nnU-Net data pipeline and do not independently distribute or retrieve data.
+
+Users are responsible for ensuring that any data used with this code are handled in accordance with applicable licenses, institutional policies, ethics approvals, and privacy requirements.
+
+## Limitations
+
+* The implementations depend on internal nnU-Net v2 trainer and decoder interfaces.
+* Changes to nnU-Net may require corresponding updates to the code.
+* The hierarchical trainer is specific to the five-class label ordering described above.
+* The repository does not provide a guaranteed end-to-end executable pipeline.
+* Performance may differ across datasets, preprocessing settings, and nnU-Net versions.
+
+## Citation
+
+Citation information will be added after the associated manuscript or technical report becomes publicly available.
+
+## License
+
+See the `LICENSE` file for the terms governing use and redistribution of this code.
+
